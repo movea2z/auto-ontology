@@ -25,6 +25,8 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_postgres import Column, PGEngine, PGVectorStore
 
+from auto_ontology.vdb.base import VDBBackend
+
 logger = logging.getLogger(__name__)
 
 _DATABASE_METADATA_COLUMN = "database_name"
@@ -63,9 +65,18 @@ def _to_async_url(url: str) -> str:
     if "+asyncpg" in url or "+psycopg" in url:
         return url
     if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    # asyncpg takes ``ssl`` (a mode string), not psycopg2's ``sslmode``; translate
+    # so one Aurora URL works on both the sync (psycopg2) and async (asyncpg)
+    # paths. Anything else (sslrootcert, etc.) passes through untouched.
+    for sslmode, ssl in (
+        ("sslmode=require", "ssl=require"),
+        ("sslmode=verify-ca", "ssl=verify-ca"),
+        ("sslmode=verify-full", "ssl=verify-full"),
+    ):
+        url = url.replace(sslmode, ssl)
     return url
 
 
@@ -134,7 +145,7 @@ def _pool_status(engine: PGEngine) -> str:
         return "?"
 
 
-class PostgresVDB:
+class PostgresVDB(VDBBackend):
     """Vector store backed by Postgres + pgvector via LangChain v2.
 
     Each record becomes a :class:`Document` whose ``page_content`` is

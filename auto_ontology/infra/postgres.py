@@ -35,7 +35,16 @@ def get_postgres_connection_string() -> str:
 
     ``database`` overrides ``POSTGRES_DATABASE`` when given (useful for
     multi-DB tools that target several databases on the same instance).
+
+    When ``AURORA_HOST`` is set the URL is built over TLS from the managed
+    Postgres (see :mod:`auto_ontology.infra.aurora`); otherwise the local
+    ``POSTGRES_*`` host is used unchanged.
     """
+    if os.environ.get("AURORA_HOST"):
+        from auto_ontology.infra.aurora import aurora_connection_string
+
+        return aurora_connection_string()
+
     host = os.environ.get("POSTGRES_HOST", "localhost")
     port = os.environ.get("POSTGRES_PORT", "5432")
     user = os.environ["POSTGRES_USER"]
