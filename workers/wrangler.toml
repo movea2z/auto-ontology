@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Auto-Ontology agent gateway — Cloudflare Workers + Containers.
+#
+# Architecture (see workers/README.md):
+#   - This Worker authenticates the client and routes to a per-session Durable
+#     Object (AGENT_DO).
+#   - The DO uses the durable_object scheduling policy to start/resume a named
+#     Container instance of the agent image and relays its SSE stream.
+#
+# Credentials are injected via `wrangler secret put` or `[vars]`; never commit
+# real secrets.
+
+name = "auto-ontology-agent-gateway"
+main = "./workers/src/agent-gateway.ts"
+compatibility_date = "2026-01-01"
+
+# --- Agent Container image -------------------------------------------------
+# The durable_object policy lets the DO choose instance size at start time.
+# image points at the repo-root Dockerfile (the existing agent image).
+[[containers]]
+  class_name = "AgentContainer"
+  scheduling_policy = "durable_object"
+  image = "./Dockerfile"
+  instance_type = "standard-1"
+
+  [containers.observability]
+    enabled = true
+    target_instance_percentage = 25
+
+# --- Session Durable Object ------------------------------------------------
+# One DO per session; holds the warm Container instance and the run handle.
+[[durable_objects.bindings]]
+  name = "AGENT_DO"
+  class_name = "AgentDo"
+
+# --- Exports ---------------------------------------------------------------
+# The session DO must be exported as a durable object with SQLite storage.
+[exports.AgentDo]
+  type = "durable-object"
+  storage = "sqlite"
+
+# --- Runtime config (override with wrangler secret put) -------------------
+[vars]
+  # Container instance size for the agent (lite, standard-1, standard-2, standard-4).
+  CONTAINER_INSTANCE_TYPE = "standard-1"
+  # Agent HTTP port inside the container (the FastAPI server).
+  AGENT_PORT = "3001"
+  # Default user id when the caller does not supply one.
+  DEFAULT_USER_ID = "auto-ontology"
+  # Enable SSO-federation auth path on the agent.
+  ANY_CONNECTION_USES_SSO_FEDERATION = "false"
+  # Shared secret the client presents to the gateway (internal path).
+  CLOUDFLARE_AGENT_SECRET = "change-me"
+  # Whether the agent Container may reach the public internet (egress for LLM,
+  # embedding, and Kumo prediction calls). Defaults to true; set "false" to
+  # sandbox the container.
+  CONTAINER_ENABLE_INTERNET = "true"
+  # Comma-separated Cloudflare Secret names forwarded into the agent Container
+  # at start time (see AgentDo.buildContainerEnv). Adjust to the agent's real
+  # runtime secrets: the catalog DB connection and the LLM/prediction keys.
+  #   - AURORA_*        : catalog DB connection (Phase 1 storage layer)
+  #   - KUMO_RFM_API_KEY / KUMO_RFM_API_URL : Kumo RFM prediction (URL is
+  #                         required by the predictor; omit to disable Kumo)
+  #   - DEFAULT_MODELS_API_KEY : shared fallback for every LLM/embedding triplet
+  #   - REASONING/NON_REASONING/EMBED/RERANK_API_KEY : per-triplet overrides
+  #     (optional; each falls back to DEFAULT_MODELS_API_KEY). Endpoints and
+  #     models fall back to built-in NVAPI defaults, or set DEFAULT_MODELS_*.
+  CONTAINER_ENV_SECRETS = "AURORA_HOST,AURORA_PORT,AURORA_USER,AURORA_PASSWORD,AURORA_DATABASE,AURORA_SSL_ROOT_CERT,KUMO_RFM_API_KEY,KUMO_RFM_API_URL,DEFAULT_MODELS_API_KEY,REASONING_API_KEY,NON_REASONING_API_KEY,EMBED_API_KEY,RERANK_API_KEY"
