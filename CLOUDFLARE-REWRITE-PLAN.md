@@ -190,30 +190,36 @@ calls `embedder.vdb.create_index()` (`semantic/pipeline.py:214`); the data layer
     traffic on public surfaces — none here.
 13. Wire LLM/embedding calls to Workers AI or keep OpenAI/Kumo via egress.
 
-### Phase 4 — Frontend (App Router → Pages+Functions)
+### Phase 4 — Frontend (App Router → Cloudflare via vinext)
 
-> **Reassessed 2026-08.** The frontend is **Next.js App Router** (`app/`), **not** the Pages
-> Router, with **81 Route Handlers** (not ~18), of which **13 touch `prisma.` directly**
-> (`acronyms`, `conversations`, `custom-prompts`, `analytics`, `configurations/*`). There is no
-> `middleware.ts` and no Cloudflare adapter is installed yet. Auth is **`better-auth`** (Prisma
-> adapter + admin/sso/apiKey/mcp plugins) with session state in cookies. The chat/agent path is
-> three Route Handlers that proxy SSE to the backend.
+> **Reassessed 2026-11.** Implemented with **vinext** (a Next.js → Cloudflare adapter), which
+> builds the existing **App Router** (`app/`) directly to Cloudflare Pages + Workers — not a
+> Pages-Router conversion and not `next-on-workers`. The frontend has **81 Route Handlers**, of
+> which **13 touch `prisma.` directly** (`acronyms`, `conversations`, `custom-prompts`,
+> `analytics`, `configurations/*`). Auth is **`better-auth`** (Prisma adapter + admin/sso/
+> apiKey/mcp plugins) with session state in cookies.
 
-14. **Convert App Router → Pages+Functions.** Move `app/api/**` Route Handlers to
-    `/functions/api/**` (via `next-on-workers` or a manual `/functions` migration) so the UI runs
-    on Pages and the API logic on Functions. Client API calls use **relative URLs**
-    (`/api/chat/completions`), so no browser change is needed — only the server routes move.
-15. **Proxy the 13 Prisma-backed data routes to the container API** rather than porting Prisma to
-    D1. The semantic-catalog graph is a heavy join/cascade graph (Database → Schema → Table →
-    Column, `ON DELETE CASCADE`) — the shape D1 handles worst. The Container already reads/writes
-    Postgres directly (`infra/aurora.py`, `dal/schema.py`), so proxy these routes to it. Reserve
-    D1 for small, high-cardinality lookups only if a later task proves it worth it.
-16. **Re-auth `better-auth`.** Its session/user/account tables currently live in Postgres via the
-    Prisma adapter. Recommend proxying its `/api/auth/...` HTTP endpoints to the container (single
-    Postgres access path, consistent with task 15) rather than splitting auth tables into D1 —
-    flag as the highest-risk Phase 4 item and confirm the final store at implementation.
-17. **Agent streaming (SSE).** The three chat Route Handlers
-    (`/chat/completions`, `/chat/cancel`, `/chat/watch`) stream token-by-token. They now forward to
+14. **vinext build toolchain — DONE, verified.** `frontend/vite.config.ts` (vinext RSC+SSR
+    build) and `frontend/cloudflare.config.ts` (the Cloudflare worker: assets, KV cache, images,
+    `compatibilityDate: 2026-11-11`) were added, plus `dev/build/start/deploy:vinext` scripts in
+    `package.json` and `react` bumped to 19.3. `tsconfig.json` excludes `.cloudflare/**` and
+    `.gitignore` ignores `/dist`, `.vinext`, `.cloudflare`. Verified: `tsc --noEmit` and
+    `vite build` (`build:vinext`) both exit 0.
+
+15. **Proxy the 13 Prisma-backed data routes to the container — DONE.** A shared
+    `frontend/auth/proxy-backend.ts` (`proxyToBackend`) forwards method/path/query/body verbatim to
+    the backend (binary-safe; `withPermission` still gates each route). `acronyms`, `analytics`,
+    `conversations`, `custom-prompts`, and `configurations/*` now delegate to it instead of reading
+    Prisma in-process, because the Container owns the `frontend` schema tables.
+
+16. **Re-auth `better-auth` — OPEN, highest-risk.** Its session/user/account tables live in
+    Postgres via the Prisma adapter (`frontend/auth/auth.ts`), and `/api/auth/[...all]` still runs
+    in the frontend build. The Prisma Postgres adapter cannot connect on the Workers edge runtime,
+    so this route must be proxied to the Container (single Postgres access path, consistent with
+    task 15) before go-live. Not yet proxied; confirm the final store at implementation.
+
+17. **Agent streaming (SSE) — DONE.** The three chat Route Handlers
+    (`/chat/completions`, `/chat/cancel`, `/chat/watch`) stream token-by-token. They forward to
     the Container gateway via `frontend/lib/containerProxy.ts` (see §5c). No new browser SSE client
     is required — the existing `api/chat.ts` → `lib/useChat.ts` path is unchanged.
 
@@ -399,6 +405,43 @@ Files changed:
 unchanged — it already uses relative URLs, so the only move is server-side.
 
 **Verified:** `tsc --noEmit` in `frontend/` exits 0 (strict) after `npm install`.
+
+---
+## 5d. Frontend Cloudflare migration via vinext (prototype - done)
+
+The frontend (Next.js App Router) was migrated to Cloudflare with **vinext**, which builds the
+existing App Router directly to Cloudflare Pages + Workers — no Pages-Router conversion and no
+`next-on-workers`. The client (`api/chat.ts` → `lib/useChat.ts`) is unchanged; only the server
+side moved.
+
+Files added:
+
+- `vite.config.ts` — vinext RSC+SSR build with the Cloudflare `cloudflare()` plugin (RSC
+  environment + SSR child environments, KV cache adapter, images optimizer).
+- `cloudflare.config.ts` — the Cloudflare worker: `entrypoint: "vinext/server/fetch-handler"`,
+  `compatibilityDate: 2026-11-11`, assets plus `VINEXT_KV_CACHE` / `IMAGES` bindings.
+- `auth/proxy-backend.ts` — `proxyToBackend(req, { userId })` forwards method/path/query/body
+  verbatim to the backend (`PYTHON_API_URL`, default `127.0.0.1:3001`), binary-safe, with
+  `withPermission` still gating each route. Zone scoping is intentionally not applied (the
+  backend's unscoped `zone_ids` default is what every proxied call gets).
+
+Files changed:
+
+- `app/api/acronyms`, `app/api/analytics`, `app/api/conversations`, `app/api/custom-prompts`,
+  `app/api/configurations/*` — replace in-process Prisma reads/writes with `proxyToBackend`; the
+  Container owns the `frontend` schema tables, so the request (query string included) forwards
+  verbatim and the answer comes back unchanged.
+- `package.json` — add `vinext`, `vite`, `@cloudflare/vite-plugin`, `@vinext/cloudflare` and the
+  `dev/build/start/deploy:vinext` scripts; `pnpm-lock.yaml` regenerated.
+- `tsconfig.json` — exclude `.cloudflare/**`; `.gitignore` ignores `/dist`, `.vinext`,
+  `.cloudflare`.
+
+**Open — higher-risk item:** `better-auth` (`frontend/auth/auth.ts`, `prismaAdapter` +
+`getPrisma()`) and its `/api/auth/[...all]` route still run in the frontend build. The Prisma
+Postgres adapter cannot connect on the Workers edge runtime, so this route must be proxied to the
+Container (consistent with the data routes above) before go-live.
+
+**Verified:** `tsc --noEmit` and `vite build` (`build:vinext`) both exit 0 in `frontend/`.
 
 ---
 
