@@ -13,8 +13,7 @@
 import { withPermission } from '@/auth/with-auth';
 import { findOwnedConversation } from '@/lib/chatConversations';
 import { buildInternalIdentityHeaders } from '@/lib/internalIdentity';
-
-const PYTHON_API_URL = process.env.PYTHON_API_URL ?? 'http://127.0.0.1:3001';
+import { forwardToContainer, SSE_RESPONSE_HEADERS } from '@/lib/containerProxy';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -36,15 +35,14 @@ export const GET = withPermission({ conversation: ['read'] })(async (req, { user
 		return new Response('Conversation not found', { status: 404 });
 	}
 
-	const upstream = await fetch(
-		`${PYTHON_API_URL}/api/chat/watch?conversation_id=${encodeURIComponent(conversationId)}`,
-		{
-			headers: {
-				Accept: 'text/event-stream',
-				...buildInternalIdentityHeaders(user.id),
-			},
+	const upstream = await forwardToContainer({
+		path: `/api/chat/watch?conversation_id=${encodeURIComponent(conversationId)}`,
+		method: 'GET',
+		headers: {
+			Accept: 'text/event-stream',
+			...buildInternalIdentityHeaders(user.id),
 		},
-	);
+	});
 
 	if (!upstream.ok || !upstream.body) {
 		return new Response('Upstream watch request failed', {
@@ -54,11 +52,6 @@ export const GET = withPermission({ conversation: ['read'] })(async (req, { user
 
 	return new Response(upstream.body, {
 		status: 200,
-		headers: {
-			'Content-Type': 'text/event-stream; charset=utf-8',
-			'Cache-Control': 'no-cache, no-transform',
-			Connection: 'keep-alive',
-			'X-Accel-Buffering': 'no',
-		},
+		headers: SSE_RESPONSE_HEADERS,
 	});
 });

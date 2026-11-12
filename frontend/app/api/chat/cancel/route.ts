@@ -14,8 +14,7 @@
 import { withPermission } from '@/auth/with-auth';
 import { findOwnedConversation } from '@/lib/chatConversations';
 import { buildInternalIdentityHeaders } from '@/lib/internalIdentity';
-
-const PYTHON_API_URL = process.env.PYTHON_API_URL ?? 'http://127.0.0.1:3001';
+import { forwardToContainer } from '@/lib/containerProxy';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -35,13 +34,11 @@ export const POST = withPermission({ conversation: ['write'] })(async (req, { us
 		return new Response('Conversation not found', { status: 404 });
 	}
 
-	const upstream = await fetch(
-		`${PYTHON_API_URL}/api/chat/cancel?conversation_id=${encodeURIComponent(conversation.id)}`,
-		{
-			method: 'POST',
-			headers: buildInternalIdentityHeaders(user.id),
-		},
-	);
+	const upstream = await forwardToContainer({
+		path: `/api/chat/cancel?conversation_id=${encodeURIComponent(conversation.id)}`,
+		method: 'POST',
+		headers: buildInternalIdentityHeaders(user.id),
+	});
 
 	if (!upstream.ok) {
 		return new Response('Upstream cancel request failed', {

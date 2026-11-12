@@ -18,8 +18,7 @@ import { withPermission } from '@/auth/with-auth';
 import { userCan } from '@/auth/permissions';
 import { resolveSubjectToken } from '@/auth/sso-token';
 import { buildInternalIdentityHeaders } from '@/lib/internalIdentity';
-
-const PYTHON_API_URL = process.env.PYTHON_API_URL ?? 'http://127.0.0.1:3001';
+import { forwardToContainer, SSE_RESPONSE_HEADERS } from '@/lib/containerProxy';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -73,14 +72,11 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 
 	let upstream: Response;
 	try {
-		upstream = await fetch(`${PYTHON_API_URL}/api/chat/completions`, {
+		upstream = await forwardToContainer({
+			path: '/api/chat/completions',
 			method: 'POST',
-			headers: upstreamHeaders,
 			body,
-			// Disable Node's transparent decompression so we can pipe bytes 1:1.
-			// @ts-expect-error — `duplex` is required by Node's fetch when
-			// streaming bodies; not yet in DOM lib types.
-			duplex: 'half',
+			headers: upstreamHeaders,
 		});
 	} catch {
 		return new Response('Backend connection failed', {
@@ -107,13 +103,6 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 		});
 	}
 
-	const responseHeaders = {
-		'Content-Type': 'text/event-stream; charset=utf-8',
-		'Cache-Control': 'no-cache, no-transform',
-		Connection: 'keep-alive',
-		'X-Accel-Buffering': 'no',
-	};
-
 	const [toClient, toKeepAlive] = upstream.body.tee();
 	after(async () => {
 		try {
@@ -122,5 +111,5 @@ export const POST = withPermission({ chat: ['use'] })(async (req, { user }) => {
 			// The browser-facing stream is already independent of this drain.
 		}
 	});
-	return new Response(toClient, { status: 200, headers: responseHeaders });
+	return new Response(toClient, { status: 200, headers: SSE_RESPONSE_HEADERS });
 });
