@@ -52,6 +52,13 @@ InputType = Literal["passage", "query"]
 # ``nvidia/nemotron-3.5-embed-1b`` on build.nvidia.com honours ``input_type``.
 _TEXT_PREFIXED_MODELS = ("nemotron-3.5-embed-1b-nvfp4",)
 
+# Nemotron 3.5 Embed 1B natively emits 2048-dim vectors, but Cloudflare Vectorize
+# caps a vector at 1536 dims. The model supports dynamic (Matryoshka) sizes from
+# 128..2048 and keeps truncated vectors effective for retrieval when L2-normalized,
+# so we embed to 1024 and store 1024-dim vectors in Vectorize. See the Vectorize
+# limits page for the cap.
+_EMBED_DIMENSIONS = 1024
+
 # Each field falls back to DEFAULT_MODELS_<field>.
 _EMBED_ENDPOINT = resolve("EMBED", "ENDPOINT")
 _EMBED_MODEL = resolve("EMBED", "MODEL")
@@ -97,6 +104,11 @@ class EmbedParams:
     nim_http_max_concurrent: int = 32
     request_timeout_s: float = 600.0
 
+
+    # Target embedding size. 1024 fits Vectorize's 1536-dim cap while the model
+    # keeps truncated vectors effective for retrieval. Kept in EmbedParams so
+    # writes and queries always agree on the dimension.
+    dimensions: int = _EMBED_DIMENSIONS
 
 def get_embed_params() -> EmbedParams:
     return EmbedParams(
@@ -189,6 +201,7 @@ def embed_texts(
             model=params.model_name,
             input=[prefix + stripped[i] for i in indices],
             encoding_format="float",
+            dimensions=params.dimensions,
             extra_body={
                 "input_type": input_type,
                 "truncate": "END",

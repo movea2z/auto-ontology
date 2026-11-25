@@ -54,7 +54,7 @@ class VectorizeVDB(VDBBackend):
         collection_name: str = "data_objects_layer",
         index_id: Optional[str] = None,
         index_name: Optional[str] = None,
-        dimension: int = 2048,
+        dimension: int = 1024,
         metric: str = "cosine",
         **kwargs: Any,
     ) -> None:

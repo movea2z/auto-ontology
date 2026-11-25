@@ -9,21 +9,22 @@
 #   DATA_VDB_COLLECTION  = "data_objects_layer"   (tabular / data layer)
 #   SEMANTIC_VDB_COLLECTION = "semantic_layer"    (glossary / semantic layer)
 #
-# The default embedder emits 2048-dimensional vectors, exceeding Vectorize's
-# documented 1536-dimension limit. Override VECTORIZE_DIMENSIONS only after
-# implementing a compatible embedding strategy for both writes and queries.
+# Nemotron 3.5 Embed 1B emits 2048-dim vectors natively, but Vectorize caps a
+# vector at 1536. The model supports dynamic (Matryoshka) sizes, so we embed to
+# 1024 and store 1024-dim vectors. Override VECTORIZE_DIMENSIONS only if the
+# embedding strategy changes, for both writes and queries.
 # https://developers.cloudflare.com/vectorize/platform/limits/
 
 set -uo pipefail
 
 cd "$(dirname "$0")"
 
-DIMENSIONS="${VECTORIZE_DIMENSIONS:-2048}"
+DIMENSIONS="${VECTORIZE_DIMENSIONS:-1024}"
 METRIC="${VECTORIZE_METRIC:-cosine}"   # cosine | euclidean
 
 if ! [[ "$DIMENSIONS" =~ ^[0-9]+$ ]] || (( 10#$DIMENSIONS < 1 || 10#$DIMENSIONS > 1536 )); then
-  echo "ERROR: VECTORIZE_DIMENSIONS must be between 1 and 1536; current default embeddings have 2048 dimensions." >&2
-  echo "Implement a compatible embedding strategy before provisioning Vectorize." >&2
+  echo "ERROR: VECTORIZE_DIMENSIONS must be between 1 and 1536 (Vectorize's cap)." >&2
+  echo "Keep it equal to the embedding dimensions used for writes." >&2
   exit 1
 fi
 INDEXES=(data_objects_layer semantic_layer)
