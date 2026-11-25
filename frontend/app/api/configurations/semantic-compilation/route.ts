@@ -2,6 +2,8 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { NextResponse } from 'next/server';
+import { getPrisma } from '@/lib/prisma';
 import { withPermission } from '@/auth/with-auth';
 import { proxyToBackend } from '@/auth/proxy-backend';
 
@@ -10,12 +12,11 @@ import { proxyToBackend } from '@/auth/proxy-backend';
 const CONFIG_KEY = 'semantic_compilation_enabled';
 
 // Report whether scheduled semantic compilation is enabled instance-wide.
-//
-// The container reads the flag the way this route used to (see
-// auto_ontology/infra/feature_flags.py), so the answer is unchanged.
-export const GET = withPermission({ semanticCompilation: ['read'] })(async (req) =>
-	proxyToBackend(req),
-);
+export const GET = withPermission({ semanticCompilation: ['read'] })(async () => {
+	const prisma = getPrisma();
+	const row = await prisma.configuration.findUnique({ where: { key: CONFIG_KEY } });
+	return NextResponse.json({ enabled: row?.value === 'true' });
+});
 
 // Turn scheduled semantic compilation on or off instance-wide (admin-only).
 //
@@ -23,9 +24,33 @@ export const GET = withPermission({ semanticCompilation: ['read'] })(async (req)
 // service's scheduler, so the change takes effect without a restart. That
 // trigger is best-effort: the setting is still saved if the service is down, and
 // the scheduler picks the flag up on its next boot.
-//
-// The trigger now happens in the container, which owns both the flag and the
-// scheduler, so the request forwards verbatim.
-export const PUT = withPermission({ semanticCompilation: ['manage'] })(async (req) =>
-	proxyToBackend(req),
-);
+export const PUT = withPermission({ semanticCompilation: ['manage'] })(async (req, { user }) => {
+	const prisma = getPrisma();
+	const body = await req.json();
+	const enabled = body.enabled === true;
+	const value = enabled ? 'true' : 'false';
+
+	await prisma.configuration.upsert({
+		where: { key: CONFIG_KEY },
+		create: { key: CONFIG_KEY, value },
+		update: { value },
+	});
+
+	// On enable, kick off a compilation run now (the ingestion service also
+	// starts its scheduler on this call, so it takes effect without a restart).
+	// Best-effort: a save must still succeed if the ingestion service is down.
+	if (enabled) {
+		try {
+			await proxyToBackend(
+				new Request(new URL('/api/semantic-compilation/trigger', req.url), {
+					method: 'POST',
+				}),
+				{ userId: user.id },
+			);
+		} catch {
+			// Swallow — the flag is persisted; the scheduler picks it up on next boot.
+		}
+	}
+
+	return NextResponse.json({ enabled });
+});

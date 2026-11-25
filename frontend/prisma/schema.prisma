@@ -17,6 +17,12 @@ generator client {
   output   = "../generated/prisma"
 }
 
+generator worker {
+  provider = "prisma-client"
+  output   = "../generated/prisma-worker"
+  runtime  = "cloudflare"
+}
+
 model Conversation {
   id         String    @id @default(uuid()) @db.Uuid
   user_id    String    @map("user_id")

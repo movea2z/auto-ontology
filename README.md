@@ -42,6 +42,13 @@ To run a text-to-SQL benchmark such as BIRD, refer to the
 - **Flexible deployment** — Helm chart for Kubernetes or Docker Compose for a
   local stack.
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — components, data flow, and trust boundaries.
+- [User guide](docs/user-guide.md) — discover and use the semantic layer.
+- [Deployment guide](docs/deployment-guide.md) — deployment paths and operations.
+- [Support guide](docs/support.md) — troubleshooting and reporting issues.
+
 ## Software Components
 
 | Component           | Technology                                                             | Role                                       | Default port |

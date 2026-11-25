@@ -2,151 +2,129 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Durable Object that orchestrates the Auto-Ontology agent Container for a
-// single session and relays its SSE stream back to the client.
-//
-// Why a DO per session:
-//   - The agent runs a long, synchronous LangGraph loop. The DO keeps a warm
-//     Container instance alive for the whole session (no mid-run teardown).
-//   - The DO holds the run handle so the client can cancel via
-//     POST /chat/cancel.
-//   - The DO relays the container's text/event-stream response verbatim, so
-//     streamed tokens reach the client without buffering.
-//
-// The durable_object scheduling policy lets this DO start/resume a named
-// Container instance of a chosen size via ctx.container.start().
+// Per-user Durable Object: starts the Python API Container and streams its
+// responses without buffering.
 
-import { DurableObject, ContainerInstance } from "cloudflare:workers";
-import { resolveIdentity, INTERNAL_USER_HEADER, ResolvedIdentity } from "./auth.js";
+import { DurableObject } from "cloudflare:workers";
+import { resolveIdentity, INTERNAL_USER_HEADER, GATEWAY_SECRET_HEADER } from "./auth.js";
 
-// ctx.container is provided by the runtime on the durable_object scheduling
-// policy but is not yet in the published workers-types; declare the shape we use.
 interface ContainerState {
   container: {
+    running: boolean;
+    images: Record<string, string>;
     start(options: {
+      image: string;
       instance?: string;
-      instance_type?: string;
-      runtime?: string;
-      enableInternet?: boolean;
-      envVars?: Record<string, string>;
-    }): Promise<void>;
-    getByName(name: string): ContainerInstance;
+      enableInternet: boolean;
+      env?: Record<string, string>;
+    }): void;
+    getTcpPort(port: number): {
+      fetch(request: Request): Promise<Response>;
+    };
   };
 }
 
 export class AgentDo extends DurableObject<Env> {
-  // Per-session state.
-  private instanceName = "default";
-  private runHandle = { active: true };
+  private startPromise: Promise<void> | null = null;
+  private readyPromise: Promise<void> | null = null;
+  private containerReady = false;
 
-  // The ctx.container namespace (runtime-provided; see ContainerState above).
   private get container() {
     return (this.ctx as unknown as ContainerState).container;
   }
 
-  // Build the runtime env map for the agent Container from the Cloudflare
-  // Secrets named in CONTAINER_ENV_SECRETS (comma-separated). The agent needs
-  // these to run: the catalog DB connection and the LLM/prediction keys. They
-  // are injected at start time, never baked into the image.
   private buildContainerEnv(): Record<string, string> {
     const names = (this.env.CONTAINER_ENV_SECRETS ?? "")
       .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const src = this.env as unknown as Record<string, string | undefined>;
-    const envVars: Record<string, string> = {};
+      .map((name) => name.trim())
+      .filter((name) => /^[A-Z][A-Z0-9_]*$/.test(name) && name !== "CLOUDFLARE_AGENT_SECRET");
+    const bindings = this.env as unknown as Record<string, string | undefined>;
+    const values: Record<string, string> = {};
     for (const name of names) {
-      const value = src[name];
-      if (value === undefined || value === "") {
-        console.warn(`AgentDo: secret ${name} not set; omitting from container env`);
-        continue;
-      }
-      envVars[name] = value;
+      const value = bindings[name];
+      if (value !== undefined && value !== "") values[name] = value;
     }
-    return envVars;
+    return values;
   }
 
-  // Ensure a named Container instance exists and is ready, then return its
-  // fetch handle. Idempotent: starting an already-running instance is a no-op.
-  private async getInstance(): Promise<ContainerInstance> {
-    await this.container.start({
-      instance: this.instanceName,
-      instance_type: this.env.CONTAINER_INSTANCE_TYPE,
-      // Egress for the agent's LLM/embedding + Kumo prediction calls (Phase 3
-      // task 13). The Python agent reaches NVAPI and Kumo over the public
-      // internet; leave false to keep the container fully sandboxed.
-      enableInternet: this.env.CONTAINER_ENABLE_INTERNET !== "false",
-      envVars: this.buildContainerEnv(),
-    });
-    return this.container.getByName(this.instanceName);
+  private async startContainer(): Promise<void> {
+    const container = this.container;
+    if (!container.running && this.containerReady) {
+      this.startPromise = null;
+      this.readyPromise = null;
+      this.containerReady = false;
+    }
+    if (!container.running && !this.startPromise) {
+      this.startPromise = Promise.resolve(
+        container.start({
+          image: container.images.base,
+          instance: this.env.CONTAINER_INSTANCE_TYPE || "standard-1",
+          enableInternet: this.env.CONTAINER_ENABLE_INTERNET !== "false",
+          env: this.buildContainerEnv(),
+        }),
+      ).catch((error: unknown) => {
+        this.startPromise = null;
+        throw error;
+      });
+    }
+    await this.startPromise;
   }
 
-  // Build the upstream request to the agent, injecting the internal identity.
-  private buildUpstreamRequest(request: Request, identity: ResolvedIdentity): Request {
-    const url = new URL(request.url);
-    url.host = "127.0.0.1";
-    url.port = String(this.env.AGENT_PORT);
-    url.protocol = "http";
-
-    const headers = new Headers(request.headers);
-    headers.set(INTERNAL_USER_HEADER, identity.userId);
-    if (identity.ssoToken) {
-      headers.set("authorization", `Bearer ${identity.ssoToken}`);
-    }
-
-    return new Request(url.toString(), {
-      method: request.method,
-      headers,
-      body: request.body,
-      redirect: "manual",
-    });
-  }
-
-  // Route the client request to the agent Container, relaying the SSE stream.
-  async fetch(request: Request): Promise<Response> {
-    const identity = resolveIdentity(request, this.env);
-    if (!identity) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // POST /chat/cancel — stop the active run.
-    if (request.method === "POST" && path.endsWith("/chat/cancel")) {
-      this.runHandle.active = false;
-      return new Response("Cancelled", { status: 200 });
-    }
-
-    // Any other request is proxied to the agent Container.
-    const instance = await this.getInstance();
-    const upstream = this.buildUpstreamRequest(request, identity);
-
-    // start() does not wait for the container's ports to be ready, so the first
-    // fetch can race the boot and throw a connection error. Retry a few times
-    // with backoff while the container warms up. Once fetch() returns a Response
-    // (including a streaming SSE body) we return it immediately — no retry — so a
-    // live stream is never duplicated.
-    return this.fetchWithWarmup(instance, upstream);
-  }
-
-  private async fetchWithWarmup(
-    instance: ContainerInstance,
-    upstream: Request,
-    retries = 5,
-  ): Promise<Response> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt <= retries; attempt++) {
+  private async waitForReady(port: number): Promise<void> {
+    const fetcher = this.container.getTcpPort(port);
+    for (let attempt = 0; attempt < 60; attempt++) {
       try {
-        return await instance.fetch(upstream);
-      } catch (err) {
-        lastErr = err;
-        if (attempt < retries) {
-          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
-        }
+        const response = await fetcher.fetch(new Request("http://container/api/health/live"));
+        if (response.ok) return;
+        await response.body?.cancel();
+      } catch {
+        // Container process is still starting or its port is not ready.
       }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    console.error("AgentDo: container fetch failed after warm-up", lastErr);
-    return new Response("Bad Gateway", { status: 502 });
+    throw new Error("Python Container did not become ready within 60 seconds");
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const identity = await resolveIdentity(request, this.env);
+    if (!identity) return new Response("Unauthorized", { status: 401 });
+
+    const url = new URL(request.url);
+    const port = Number(this.env.AGENT_PORT);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return new Response("Gateway misconfigured", { status: 500 });
+    }
+
+    try {
+      await this.startContainer();
+      if (!this.readyPromise) {
+        this.readyPromise = this.waitForReady(port).catch((error: unknown) => {
+          this.startPromise = null;
+          this.containerReady = false;
+          this.readyPromise = null;
+          throw error;
+        });
+      }
+      await this.readyPromise;
+      this.containerReady = true;
+
+      const headers = new Headers(request.headers);
+      headers.delete(GATEWAY_SECRET_HEADER);
+      headers.set(INTERNAL_USER_HEADER, identity.userId);
+      const upstream = new Request(`http://container${url.pathname}${url.search}`, {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: "manual",
+      });
+      return await this.container.getTcpPort(port).fetch(upstream);
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "Container gateway request failed",
+        error: error instanceof Error ? error.message : String(error),
+        path: url.pathname,
+      }));
+      return new Response("Bad Gateway", { status: 502 });
+    }
   }
 }

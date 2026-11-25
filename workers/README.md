@@ -1,86 +1,125 @@
-# Auto-Ontology Agent Gateway — Cloudflare Containers + Durable Objects
+# Auto-Ontology Worker Gateway
 
-**Phase 3, Milestone H2.** A Cloudflare Workers + Containers gateway that
-authenticates clients and proxies to the Auto-Ontology LangGraph agent, which
-runs inside a Container and streams results back over SSE.
+Cloudflare Worker authenticates the frontend server, routes requests to a
+per-user Durable Object, starts Python FastAPI Container, and streams responses
+without buffering.
 
-## Why this shape
+## Request flow
 
-The agent is a long, synchronous LangGraph loop (tool calls, MCP round-trips,
-multi-step reasoning, optional human-in-the-loop pauses). That does not fit the
-Workers Python runtime (no `langgraph`; `langchain-core` there is ~5 major
-versions older). So the agent image runs **unchanged** in a Cloudflare
-**Container**, and a Workers layer handles auth + session orchestration + SSE
-relaying.
-
-```
-client ──auth──▶ Worker (agent-gateway.ts)
-                        │  resolveIdentity()  (shared secret OR SSO bearer)
-                        ▼
-              Durable Object (agent-do.ts)   ← one per session
-                        │  ctx.container.start({ instance, instance_type })
-                        ▼
-              Container (AgentContainer)     ← agent image, LangGraph loop
-                        │  fetch()  (127.0.0.1:AGENT_PORT)
-                        ▼
-              FastAPI /chat/completions  ──text/event-stream──▶ client
+```text
+frontend server -> Worker -> per-user Durable Object -> Container :3001
+                                           /api/* -> FastAPI
 ```
 
-## Files
+Worker exposes public `GET /health` and authenticated `/api/*`. It forwards
+backend paths and query strings unchanged, including chat endpoints:
 
-| File | Role |
-| --- | --- |
-| `src/agent-gateway.ts` | Worker entry point. Health check, auth, per-session DO routing. |
-| `src/agent-do.ts` | Session Durable Object. Starts/resumes the Container instance, relays SSE, handles cancel. |
-| `src/agent-container.ts` | Container lifecycle class. Raises `sleepAfter` and keeps the instance warm for the session. |
-| `src/auth.ts` | Identity contract: internal shared-secret path and SSO-federation path. Mirrors the agent's `resolve_internal_user`. |
-| `wrangler.toml` | Container + durable-object bindings, instance size, vars. |
-| `types/*.d.ts` | Ambient types for the Container API and `Env` (the published `workers-types` lags the Container runtime). |
+- `POST /api/chat/completions` — streams chat SSE.
+- `GET /api/chat/watch` — streams an existing run.
+- `POST /api/chat/cancel` — cancels backend run.
+- Other `/api/*` routes — proxied to FastAPI.
 
-## Auth contract
+All response bodies stream directly from Container. Gateway does not implement
+conversation authorization; frontend server must authenticate the user and
+enforce route permissions before proxying.
 
-The agent must never be publicly reachable. The gateway validates the client
-and forwards an internal identity header. Two paths, matching the agent's own
-`resolve_internal_user`:
+## Authentication and identity
 
-1. **Internal service-to-service** — client presents `Authorization: Bearer
-   <CLOUDFLARE_AGENT_SECRET>`; gateway injects
-   `x-auto-ontology-user-id: <user-id>`.
-2. **SSO federation** — client presents a valid SSO bearer token; gateway
-   validates it and forwards the resolved subject. Enabled on the agent when
-   `ANY_CONNECTION_USES_SSO_FEDERATION=true`.
+Every `/api/*` request MUST include:
 
-Set `CLOUDFLARE_AGENT_SECRET` via `wrangler secret put CLOUDFLARE_AGENT_SECRET`
-— never commit it.
+- `x-auto-ontology-gateway-secret: <CLOUDFLARE_AGENT_SECRET>`
+- `x-auto-ontology-user-id: <authenticated user id>`
 
-## Container lifecycle
+Set `CLOUDFLARE_AGENT_SECRET` as a Worker secret, never as a committed var:
 
-- `sleepAfter = 30m` (default 10m is too short for a HITL pause).
-- `onActivityExpired` is a no-op so a warm instance survives the session; the
-  DO stops it explicitly when the session ends.
-- Instance size is chosen by the DO at start time (`CONTAINER_INSTANCE_TYPE`,
-  default `standard-1`).
-
-## Deploy
-
-```bash
+```sh
 cd workers
-wrangler secret put CLOUDFLARE_AGENT_SECRET --value '<secret>'
+wrangler secret put CLOUDFLARE_AGENT_SECRET
+```
+
+Configure the frontend Worker with the gateway's HTTPS URL as
+`AGENT_GATEWAY_URL` and the same `CLOUDFLARE_AGENT_SECRET` as a secret.
+Neither value should be exposed to browser code. Rotate the shared secret on
+both Workers together.
+
+The frontend Worker also requires `APP_URL`, a strong persistent `AUTH_SECRET`,
+and a `HYPERDRIVE` binding to the shared PostgreSQL database. Create Hyperdrive
+with query caching disabled: authentication and frontend data require
+read-after-write consistency. Set `CLOUDFLARE_HYPERDRIVE_ID` to its ID when
+building or deploying the frontend; no database password belongs in Worker
+configuration. The frontend and Python services must use the same migrated
+database until the planned D1 cutover.
+
+Prisma generates separate Node and Cloudflare clients from
+`frontend/prisma/schema.prisma`. Run `pnpm db:generate` after schema changes;
+the Worker uses request-scoped clients and Hyperdrive connection pooling.
+
+Before the first Worker deployment, apply the frontend Prisma schema to the
+shared database and bootstrap an admin from a trusted machine or migration
+job with database network access. Provide `POSTGRES_*`,
+`AUTO_ONTOLOGY_ADMIN_EMAIL`, and `AUTO_ONTOLOGY_ADMIN_PASSWORD` through a
+protected environment, then run from `frontend/`:
+
+```sh
+pnpm exec tsx -e 'import { seedAdmin } from "./auth/seed-admin"; seedAdmin().catch((err) => { console.error(err); process.exitCode = 1; })'
+```
+
+`seedAdmin` does nothing if either admin variable is absent. If that email
+already exists, it resets the account's password and restores its admin role;
+run it only when that is intended. Do not rely on Worker isolate startup to
+seed accounts.
+
+Missing secret, missing identity, or mismatched secret returns `401`.
+`Authorization` does not authenticate gateway. Gateway preserves it as optional
+SSO subject token for FastAPI, strips gateway-secret header, then overwrites
+backend identity header with authenticated proxy identity. Worker does not
+validate SSO token; frontend server owns authentication and authorization.
+
+Enable `ANY_CONNECTION_USES_SSO_FEDERATION=true` in `workers/wrangler.toml` only
+when frontend validates SSO tokens before forwarding them. That setting is
+passed into Python Container with its runtime environment.
+
+Worker scopes Durable Object by authenticated user ID, never client-provided
+session IDs. This keeps each user's Container/API process separate. Backend
+still enforces conversation ownership using forwarded identity.
+
+## Container configuration
+
+`wrangler.toml` is run from `workers/`; `main` points to `./src/agent-gateway.ts`
+and container image points to repo-root `../Dockerfile`. Dockerfile serves
+FastAPI on port `3001`, routes are under `/api/`, and Worker defaults to port
+`3001`.
+
+Configure a deploy:
+
+```sh
+cd workers
+wrangler secret put CLOUDFLARE_AGENT_SECRET
+wrangler secret put AURORA_PASSWORD
+# Add other runtime secrets used by the agent.
 wrangler deploy
 ```
 
-## Notes / open items
+`CONTAINER_ENV_SECRETS` lists binding names forwarded into Python Container at
+start. Configure database and model credentials with `wrangler secret put` and
+add required names to this list. SSO federation flag is a non-secret Worker var
+included in the list. Gateway secret is explicitly excluded from Container
+environment. `CONTAINER_ENABLE_INTERNET=true` enables outbound model/API
+requests; set false only when agent does not need external services.
 
-- The `durable_object` Container scheduling policy is in **beta**; confirm the
-  exact `ctx.container.start` / `getByName` method names against the live
-  Container API at deploy time.
-- The published `@cloudflare/workers-types` predates the Container lifecycle
-  API, so the types are declared locally in `types/cloudflare-containers.d.ts`.
-- The Container image is the repo-root `Dockerfile` (the existing agent image);
-  no Python changes are required for H2.
-- **Container runtime env.** The agent needs its catalog DB connection and LLM/
-  prediction keys to run. These are Cloudflare Secrets forwarded into the
-  Container at start time by `AgentDo.buildContainerEnv()`, driven by the
-  comma-separated `CONTAINER_ENV_SECRETS` var in `wrangler.toml`. Add the agent's
-  real secret names there (and `wrangler secret put` each). They are never baked
-  into the image.
+Worker starts Container using `ctx.container.start({ image, instance,
+enableInternet, env })`, probes its documented `/api/health/live` endpoint for
+up to 60 seconds, then forwards through `ctx.container.getTcpPort(3001)`.
+Container and Durable Object are one per active user, so running instance count
+and cost scale with active users.
+
+## Limitations
+
+- Gateway secret is shared between frontend server and Worker; rotate both
+  sides together. Do not expose it to browser code.
+- Worker trusts identity asserted by holder of gateway secret. Protect that
+  secret and ensure frontend server derives identity from authenticated session,
+  never client-supplied identity headers.
+- Gateway does not validate SSO/JWT tokens or apply per-route permissions.
+- Backend still requires external Postgres and configured model/provider
+  credentials; gateway does not replace those dependencies.

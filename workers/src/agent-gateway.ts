@@ -2,31 +2,31 @@
 // All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Auto-Ontology agent gateway Worker.
+// Auto-Ontology API gateway. Authenticates frontend-server requests, routes
+// by trusted user identity, and streams Container responses.
 //
-// Entry point. It authenticates the client, derives a per-session Durable
-// Object id, and forwards the request to that DO, which relays the agent
-// Container's SSE stream.
-//
-// Routing:
-//   POST /chat/completions  -> DO (SSE stream)
-//   POST /chat/watch        -> DO (reconnect)
-//   POST /chat/cancel       -> DO (cancel run)
-//   GET  /health            -> 200 (no DO needed)
+// Routes:
+//   /api/*       -> per-user Durable Object -> Python FastAPI
+//   GET /health  -> unauthenticated liveness check
 
-import { resolveIdentity, AUTH_HEADER } from "./auth.js";
+import { resolveIdentity } from "./auth.js";
+export { AgentDo } from "./agent-do.js";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Public health check — no auth, no DO.
-    if (url.pathname === "/health") {
+    if (url.pathname === "/health" && request.method === "GET") {
       return new Response("ok", { status: 200 });
     }
+    if (
+      !url.pathname.startsWith("/api/") ||
+      !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(request.method)
+    ) {
+      return new Response("Not found", { status: 404 });
+    }
 
-    // Authenticate the client.
-    const identity = resolveIdentity(request, env);
+    const identity = await resolveIdentity(request, env);
     if (!identity) {
       return new Response("Unauthorized", {
         status: 401,
@@ -34,12 +34,10 @@ export default {
       });
     }
 
-    // Derive a per-session DO id from the session id (or a generated one).
-    const sessionId = url.searchParams.get("sessionId") ?? identity.userId;
-    const doId = env.AGENT_DO.idFromName(sessionId);
-
-    // Forward to the DO, which manages the Container instance and relays SSE.
-    const doStub = env.AGENT_DO.get(doId);
-    return doStub.fetch(request);
+    // A single container per authenticated user keeps all of that user's API
+    // and chat requests together while preventing caller-selected session IDs
+    // from routing requests into another user's Durable Object.
+    const doId = env.AGENT_DO.idFromName(JSON.stringify([identity.userId]));
+    return env.AGENT_DO.get(doId).fetch(request);
   },
 } satisfies ExportedHandler<Env>;

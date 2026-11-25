@@ -4,7 +4,7 @@
 
 import { headers } from 'next/headers';
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { withPermission } from '@/auth/with-auth';
 import { apiTokenErrorResponse, requireSessionCaller } from '@/lib/apiTokens';
 
@@ -23,7 +23,7 @@ export const DELETE = withPermission<Ctx>({ apiToken: ['manage'] })(async (_req,
 	const { id } = await params;
 
 	try {
-		await auth.api.deleteApiKey({ body: { keyId: id }, headers: await headers() });
+		await getAuth().api.deleteApiKey({ body: { keyId: id }, headers: await headers() });
 	} catch (err) {
 		// A 404 here means "no such token of yours"; a failed delete is a 5xx and
 		// must keep propagating, so the caller is never told a token is gone

@@ -9,17 +9,10 @@
 #   DATA_VDB_COLLECTION  = "data_objects_layer"   (tabular / data layer)
 #   SEMANTIC_VDB_COLLECTION = "semantic_layer"    (glossary / semantic layer)
 #
-# Why these exact options:
-#   * --dimensions=2048  the embedder (nemotron-3.5-embed-1b) emits 2048-dim
-#                        vectors; the pgvector store declares vector_size=2048.
-#   * --metric=cosine    matches the pgvector halfvec_cosine_ops ranking.
-#
-# The Python Container authenticates to Vectorize with CLOUDFLARE_API_TOKEN via
-# the cloudflare SDK (see auto_ontology/vdb/vectorize.py) — NOT a Workers
-# binding — so no [[vectorize]] binding is needed for the agent path. The code
-# also auto-creates a missing index (dim=2048, metric=cosine) on first use, so
-# this script is best practice (stable IDs, fail-fast on bad token) rather than
-# a hard requirement.
+# The default embedder emits 2048-dimensional vectors, exceeding Vectorize's
+# documented 1536-dimension limit. Override VECTORIZE_DIMENSIONS only after
+# implementing a compatible embedding strategy for both writes and queries.
+# https://developers.cloudflare.com/vectorize/platform/limits/
 
 set -uo pipefail
 
@@ -27,6 +20,12 @@ cd "$(dirname "$0")"
 
 DIMENSIONS="${VECTORIZE_DIMENSIONS:-2048}"
 METRIC="${VECTORIZE_METRIC:-cosine}"   # cosine | euclidean
+
+if ! [[ "$DIMENSIONS" =~ ^[0-9]+$ ]] || (( 10#$DIMENSIONS < 1 || 10#$DIMENSIONS > 1536 )); then
+  echo "ERROR: VECTORIZE_DIMENSIONS must be between 1 and 1536; current default embeddings have 2048 dimensions." >&2
+  echo "Implement a compatible embedding strategy before provisioning Vectorize." >&2
+  exit 1
+fi
 INDEXES=(data_objects_layer semantic_layer)
 
 if ! command -v wrangler >/dev/null 2>&1; then

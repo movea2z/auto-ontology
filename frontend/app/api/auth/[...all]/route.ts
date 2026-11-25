@@ -4,11 +4,28 @@
 
 import { NextResponse } from 'next/server';
 import { toNextJsHandler } from 'better-auth/next-js';
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { isMcpClientCallback, mcpHandoffLocation } from '@/auth/oauth-loopback';
 import { withPublic } from '@/auth/with-auth';
 
-const handlers = toNextJsHandler(auth);
+// Better Auth's GET surface: session lookup and the SSO callbacks.
+//
+// Public by design — sign-in and the callback that completes it must both be
+// reachable without a session. The plugin's own `/api/auth/api-key/*` routes
+// are blocked here so `/api/api-tokens` stays the single way to manage tokens.
+export const GET = withPublic(async (req) => {
+	const handlers = toNextJsHandler(getAuth());
+	return blockPluginApiKeyRoutes(rewriteMcpClientRedirect(handlers.GET))(req);
+});
+// Better Auth's POST surface: sign-in, sign-out, and the SSO callbacks.
+//
+// Public for the same reason GET is — none of it can require a session. The
+// plugin's own `/api/auth/api-key/*` management routes are blocked here so
+// `/api/api-tokens` stays the single way to mint or revoke a token.
+export const POST = withPublic(async (req) => {
+	const handlers = toNextJsHandler(getAuth());
+	return blockPluginApiKeyRoutes(rewriteMcpClientRedirect(handlers.POST))(req);
+});
 
 // The apiKey plugin mounts its own management endpoints under this catch-all
 // (`/api/auth/api-key/create|get|list|update|delete`). They are session-gated by
@@ -58,16 +75,3 @@ const rewriteMcpClientRedirect =
 			headers,
 		});
 	};
-
-// Better Auth's GET surface: session lookup and the SSO callbacks.
-//
-// Public by design — sign-in and the callback that completes it must both be
-// reachable without a session. The plugin's own `/api/auth/api-key/*` routes
-// are blocked here so `/api/api-tokens` stays the single way to manage tokens.
-export const GET = withPublic(blockPluginApiKeyRoutes(rewriteMcpClientRedirect(handlers.GET)));
-// Better Auth's POST surface: sign-in, sign-out, and the SSO callbacks.
-//
-// Public for the same reason GET is — none of it can require a session. The
-// plugin's own `/api/auth/api-key/*` management routes are blocked here so
-// `/api/api-tokens` stays the single way to mint or revoke a token.
-export const POST = withPublic(blockPluginApiKeyRoutes(rewriteMcpClientRedirect(handlers.POST)));

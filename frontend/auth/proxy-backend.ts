@@ -14,6 +14,8 @@
 // is what every proxied call gets.
 
 import { buildInternalIdentityHeaders } from '@/lib/internalIdentity';
+import { resolveUser } from '@/auth/resolve-user';
+import { forwardToContainer, gatewayEnabled } from '@/lib/containerProxy';
 
 const PYTHON_API_URL = process.env.PYTHON_API_URL ?? 'http://127.0.0.1:3001';
 
@@ -54,14 +56,33 @@ export async function proxyToBackend(
 	if (userId) Object.assign(headers, buildInternalIdentityHeaders(userId));
 
 	const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
-	const body = hasBody ? await req.text() : undefined;
+	const body = hasBody ? (req.body ?? undefined) : undefined;
 
-	const upstream = await fetch(target, { method: req.method, headers, body });
+	let upstream: Response;
+	if (await gatewayEnabled()) {
+		// Every caller is permission-gated. Resolve identity again when it was
+		// not passed explicitly; never trust a client-supplied identity header.
+		const resolvedUserId = userId ?? (await resolveUser())?.id;
+		if (!resolvedUserId) return new Response('Unauthorized', { status: 401 });
+		Object.assign(headers, buildInternalIdentityHeaders(resolvedUserId));
+		upstream = await forwardToContainer({
+			path: `${incoming.pathname}${incoming.search}`,
+			method: req.method,
+			headers,
+			body,
+		});
+	} else {
+		const init: RequestInit = { method: req.method, headers, body };
+		if (body) {
+			// Node's fetch requires duplex for streamed request bodies.
+			// @ts-expect-error -- duplex is not part of the DOM RequestInit type.
+			init.duplex = 'half';
+		}
+		upstream = await fetch(target, init);
+	}
 
-	// Relayed as bytes: decoding as text would replace every byte of a binary
-	// answer, such as the Ossie export's zip, that is not valid UTF-8.
-	const respBody = await upstream.arrayBuffer();
-	return new Response(respBody, {
+	// Preserve binary responses and stream them without buffering in the Worker.
+	return new Response(upstream.body, {
 		status: upstream.status,
 		headers: {
 			'Content-Type': upstream.headers.get('content-type') ?? 'application/json',

@@ -1,23 +1,26 @@
 # Auto-Ontology — Cloudflare-Native Rewrite Plan
 
-> Status: **Compute can run on Cloudflare (Containers); the only external dependency is managed PostgreSQL.**
-> Generated from an analysis of the current Python/Postgres + pgvector + Next.js stack.
+> Status: **Prototype, not deployed.** Target frontend and gateway on Workers;
+> retain Python Containers where required and minimize external PostgreSQL use.
+
+> **Cutover blocked:** Vectorize currently permits at most 1,536 dimensions per vector,
+> but the configured embeddings have 2,048 dimensions. The Vectorize prototype is not
+> deployable as configured. Keep pgvector until an embedding model or supported
+> dimensionality-reduction strategy is selected, re-embedding is implemented, and recall
+> is measured. See [Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/).
+> The prototype also needs live API and deletion validation before it can be treated as a
+> drop-in replacement.
 
 ## 0. Verdict
 
-The original "cannot deploy on Cloudflare" verdict was based on a Workers-only assumption.
-Cloudflare **Containers** now run arbitrary Docker images with a full Linux environment, system
-libraries, and configurable CPU/memory — so the Python FastAPI backend, the LangGraph agent, the
-ingestion service, and its native database connectors can all run natively. The single unavoidable
-external piece is **managed PostgreSQL** (Cloudflare has no managed pgvector Postgres).
+The target runs the Next.js frontend and gateway on Workers. The existing Python
+agent and ingestion components need Containers until their process, thread and
+native-driver dependencies are migrated. The catalog currently needs PostgreSQL
+and pgvector; use Cloudflare-native storage for frontend state where practical
+only after removing the Python backend's direct dependencies on that state.
 
-**External (one thing only):** Managed PostgreSQL (Aurora/Neon/Supabase/Crunchy) for the relational
-semantic-catalog graph, reached from Workers via **Hyperdrive** and directly from Containers via
-`psycopg`.
-
-**Everything else runs on Cloudflare:** frontend (Pages+Functions), backend + agent (Containers),
-vector search (Vectorize), blobs (R2), sessions/caches (D1/KV), ingestion orchestration (Cron +
-Queues), edge auth (Workers + Turnstile).
+Vectorize is not a drop-in replacement for the current embeddings; keep pgvector
+until the dimension and retrieval-validation blockers above are resolved.
 
 ---
 
@@ -25,41 +28,28 @@ Queues), edge auth (Workers + Turnstile).
 
 | Concern | Traditional constraint | Cloudflare setup |
 | --- | --- | --- |
-| Edge API & Auth | Needs global distribution | Workers + Turnstile + KV |
-| Agent Runtime | Long-running sync LangGraph loop | **Containers (Python)** bound to **Durable Objects** |
-| Catalog Graph | Heavy joins/cascades unsuitable for D1 | **Managed Postgres via Hyperdrive**; `ltree` / `WITH RECURSIVE` |
-| Semantic Search | High-dim similarity queries | **Vectorize** (embeddings keyed to Postgres IDs) |
+| Edge API & Auth | Needs global distribution | Workers; Better Auth storage migration remains open |
+| Agent Runtime | Existing subprocess-based Python execution | **Containers (Python)** bound to **Durable Objects** |
+| Catalog Graph | Existing PostgreSQL schema and SQLAlchemy DAL | Managed Postgres while a native migration is unimplemented |
+| Semantic Search | 2,048-dimensional embeddings | pgvector until Vectorize compatibility and recall are validated |
 | Ingestion Engine | Native drivers, continuous daemons | **Cron → Queue → Container** (stateless batch pollers) |
 | Unstructured Assets | High egress on external buckets | **R2** |
 | Sessions / caches / rate limits | — | **D1 / KV** |
 
-### LangGraph runtime: Containers, NOT Workers Python
+### LangGraph runtime: current Python backend
 
-The agent runs in a **Cloudflare Container** (own Docker image), never on the
-**Workers Python runtime**. These are different runtimes and the distinction is
-load-bearing for LangGraph:
+Cloudflare Python Workers support bundled pure-Python and compatible WebAssembly
+packages, including FastAPI; an absent built-in LangGraph package alone does not
+prove it cannot run. The project's dependency graph still needs compatibility
+testing. See [Python Worker packages](https://developers.cloudflare.com/workers/languages/python/packages/).
 
-- The Workers Python page
-  (`/workers/languages/python/packages/langchain/`) lists only three built-in
-  LangChain packages: `langchain 0.1.8`, `langchain-core 0.1.25`,
-  `langchain-openai 0.0.6`. **`langgraph` is not provided at all**, and the
-  provided `langchain-core` (0.1.25) is ~5 major versions older than this app
-  needs.
-- The app pins `langgraph>=1.2.11`, `langchain-core>=1.6.1`,
-  `langchain-openai>=1.3.0` (root `pyproject.toml`). That cannot run on the
-  Workers Python runtime: the built-in framework is far too old and LangGraph
-  has no built-in to vendor against.
-- In a **Container** you `pip install` the same pins the app already declares —
-  LangGraph runs unchanged. The Workers package list is irrelevant there.
+The existing agent uses `multiprocessing` to isolate and cancel synchronous work
+(`auto_ontology/server/chat/worker.py`), and ingestion uses threads. Those modules
+are not functional in Python Workers' WebAssembly runtime. The existing backend
+therefore needs a Container unless those execution paths and incompatible native
+drivers are replaced. See [Python standard library support](https://developers.cloudflare.com/workers/languages/python/stdlib/).
 
-**Conclusion:** host the agent in a Container. If anyone proposes running it on
-Workers Python to cut cost, LangGraph (plus the 0.1.25 vs ≥1.6.1 gap) is the
-concrete blocker — the alternatives are risky vendoring or a full TypeScript
-rewrite (Workflows / Agents SDK).
-
-**State:** LangGraph checkpointers need a store. Use the external managed
-Postgres (Aurora) for graph state, or Durable Object storage for light
-checkpoints — never container memory, since Containers restart.
+Containers can restart, so durable application state must not depend on their memory.
 
 ---
 
@@ -75,8 +65,7 @@ checkpoints — never container memory, since Containers restart.
    So a Queue→Container path needs a **Worker bridge**; there is no direct queue-consumer container.
 3. **Hyperdrive read-after-write staleness**: Hyperdrive does **not** invalidate cached reads on
    writes — a matching `SELECT` can return cached results until `max_age` expires. Writes still go to
-   the DB. The semantic catalog is write-heavy, so use a **short `max_age`** or bypass the cache on
-   write-sensitive reads.
+   the DB. Disable query caching for frontend authentication and other reads requiring consistency.
 4. **Vectorize has no `halfvec` and limited metrics** (cosine/euclidean). The current store uses
    **2048-dim** vectors — verify dimension + metric fit before committing.
 5. **Pure-Workers agent alternative** (Workflows / Agents SDK / `@cloudflare/ai-chat`) is TypeScript —
@@ -116,13 +105,29 @@ Ingestion:
 ---
 
 ## 4. Ordered task list
+## 4a. Phase status (as of 2026-11-24)
+
+| Phase | Status | Tasks |
+| --- | --- | --- |
+| Phase 0 — Decisions & procurement | **Partial** | 1–3 done; 4 BLOCKED (Vectorize 1,536 max vs 2,048 embed) |
+| Phase 1 — Storage layer | **Prototype done** | 6 satisfied by existing schema; provisioning moved to Phase 7 |
+| Phase 2 — Catalog graph migration | **~90% done** | 8 DONE; 9 interface DONE; 11–13 remaining (blocked on task 4) |
+| Phase 3 — Agent runtime | **Prototype done** | 10–13: gateway prototype committed; deployed validation OPEN |
+| Phase 4 — Frontend (vinext) | **Prototype done** | 14 DONE; 15 restored, deployed verification OPEN; 16 OPEN; 17 prototype |
+| Phase 5 — Ingestion | **Not started** | 16–17 not started |
+| Phase 6 — Verify & cut over | **Not started** | 18–19 not started |
+| Phase 7 — Deployment | **Not started** | 1–7 not started |
+
+
 
 ### Phase 0 — Decisions & procurement
 1. Procure the one external dependency: **managed PostgreSQL** (Aurora — already available).
 2. Lock agent-runtime decision: **Container + DO** (keeps Python LangGraph) — recommended.
 3. Decide container lifecycle policy: override `sleepAfter` for HITL; set `max_age` strategy for
    Hyperdrive on write-sensitive catalog reads.
-4. Confirm Vectorize dim/metric fit for the 2048-dim embeddings.
+4. **BLOCKED — Vectorize dimension fit:** Cloudflare's documented maximum is 1,536,
+   below the current 2,048-dimensional embedding. Select and validate a compatible
+   embedding strategy before provisioning or re-embedding. Cosine is supported.
 
 ### Phase 1 — Storage layer
 Storage wiring is prototype-complete (see §5a): `vdb/base.py`, `vdb/vectorize.py`, `vdb/postgres.py`,
@@ -169,10 +174,10 @@ calls `embedder.vdb.create_index()` (`semantic/pipeline.py:214`); the data layer
 
 > Task 10 (Provision Vectorize) is a deployment action — moved to **Phase 7** (§4 Phase 7).
 
-11. **Re-embed into Vectorize.** Run `compile_semantic_layer` + data-layer ingest with
-    `AUTO_ONTOLOGY_VDB_BACKEND=vectorize`; confirm every row upserts keyed by its catalog id and
-    that `delete_by_database`/`delete_all` clean up correctly (Vectorize `delete_all` recreates the
-    index — no bulk delete-all).
+11. **Blocked on task 4 and provider implementation.** Once a compatible embedding strategy
+    is selected, implement it consistently for indexing and queries, then run
+    `compile_semantic_layer` + data-layer ingest. Verify catalog IDs and complete deletion
+    against the live Vectorize API; current prototype deletion is not validated.
 12. **Integration-validate the switch.** Run the `Retriever` against Vectorize with a live DB and
     confirm the `metadata_filter_format = "dict"` → Vectorize `where`-filter contract end-to-end
     (beyond the offline unit tests in `vdb/tests/`).
@@ -181,13 +186,13 @@ calls `embedder.vdb.create_index()` (`semantic/pipeline.py:214`); the data layer
 
 ### Phase 3 — Agent runtime (Container + DO)
 10. Package FastAPI + LangGraph into a Docker image (Python + deps).
-11. Orchestrate via Durable Objects: DO spins up/resumes a container per session, proxies the
-    WebSocket/SSE stream for live token output and HITL, hibernates to zero after the run.
-12. Build the Worker gateway (auth-only) that fronts the DO/container and streams tokens. No
-    Turnstile: every caller must already be authenticated (shared-secret service-to-service or
-    SSO bearer), so the gateway's existing auth is the gate and there is no unauthenticated
-    browser surface to protect. Turnstile was dropped because it only guards browser-human
-    traffic on public surfaces — none here.
+11. **Gateway prototype:** a per-user Durable Object starts a Python Container
+    and streams responses. Validate startup, isolation, cancellation and restart
+    behavior against the deployed runtime before relying on it.
+12. The frontend Worker authenticates users and supplies a gateway secret and
+    trusted user ID; the gateway verifies that secret and forwards SSO subject
+    tokens separately. Provision the secret in both Workers. Do not expose it
+    to browsers. See `workers/README.md`.
 13. Wire LLM/embedding calls to Workers AI or keep OpenAI/Kumo via egress.
 
 ### Phase 4 — Frontend (App Router → Cloudflare via vinext)
@@ -206,22 +211,31 @@ calls `embedder.vdb.create_index()` (`semantic/pipeline.py:214`); the data layer
     `.gitignore` ignores `/dist`, `.vinext`, `.cloudflare`. Verified: `tsc --noEmit` and
     `vite build` (`build:vinext`) both exit 0.
 
-15. **Proxy the 13 Prisma-backed data routes to the container — DONE.** A shared
-    `frontend/auth/proxy-backend.ts` (`proxyToBackend`) forwards method/path/query/body verbatim to
-    the backend (binary-safe; `withPermission` still gates each route). `acronyms`, `analytics`,
-    `conversations`, `custom-prompts`, and `configurations/*` now delegate to it instead of reading
-    Prisma in-process, because the Container owns the `frontend` schema tables.
+15. **Frontend data routes — restored, deployed verification OPEN.** `acronyms`,
+    `analytics`, `conversations`, `custom-prompts`, and `configurations/*`
+    execute their permission-gated Prisma operations in the frontend again.
+    They use the shared Postgres schema until the coordinated D1 migration.
+    Local Workers preview verified authenticated conversation creation and
+    readback, and rejected an unauthenticated read.
 
-16. **Re-auth `better-auth` — OPEN, highest-risk.** Its session/user/account tables live in
-    Postgres via the Prisma adapter (`frontend/auth/auth.ts`), and `/api/auth/[...all]` still runs
-    in the frontend build. The Prisma Postgres adapter cannot connect on the Workers edge runtime,
-    so this route must be proxied to the Container (single Postgres access path, consistent with
-    task 15) before go-live. Not yet proxied; confirm the final store at implementation.
+16. **Authentication and storage — OPEN.** Better Auth and frontend-owned
+    Prisma operations use the shared PostgreSQL schema through a `HYPERDRIVE`
+    binding. Disable Hyperdrive query caching for read-after-write consistency;
+    Prisma clients are created per Worker invocation. A separate Cloudflare
+    Prisma client is generated for the Worker. First-admin bootstrap runs
+    separately; see `workers/README.md`. Local Workers preview verified health
+    and email sign-in against isolated PostgreSQL through local Hyperdrive.
+    Deployed connectivity to Aurora remains unverified.
+    Prefer D1 for frontend-owned state to reduce external Postgres use. This
+    requires a SQLite-compatible Prisma schema and D1 migrations, plus changes
+    to Python code that directly reads and writes the shared `frontend` schema.
+    Do not switch only the auth database: that would split identity and break
+    existing cross-component behavior.
 
-17. **Agent streaming (SSE) — DONE.** The three chat Route Handlers
-    (`/chat/completions`, `/chat/cancel`, `/chat/watch`) stream token-by-token. They forward to
-    the Container gateway via `frontend/lib/containerProxy.ts` (see §5c). No new browser SSE client
-    is required — the existing `api/chat.ts` → `lib/useChat.ts` path is unchanged.
+17. **Agent streaming (SSE) — prototype.** Chat Route Handlers forward to the
+    gateway via `frontend/lib/containerProxy.ts`, preserving the browser client.
+    Runtime streaming, cancellation, and end-to-end authentication remain to be
+    validated with the deployed Worker and Container.
 
 ### Phase 5 — Ingestion (event-driven, no daemons)
 16. Replace `IntervalScheduler` daemons with **Cron → Worker → Queue → Container** bridge.
@@ -245,12 +259,13 @@ and cut over with rollback. Provisioning is a Cloudflare-side action (resources 
 `wrangler.toml` / the dashboard, not the Python repo), so it is consolidated here rather than
 scattered across the build phases.
 
-1. **Provision Hyperdrive** (task 5) against the managed Postgres — Workers edge pooling + read
-   cache for read-sensitive catalog reads; short `max_age` or cache-bypass on write-sensitive
-   reads. Connection string via `cf` / dashboard.
-2. **Provision Vectorize** (tasks 7/10) — one namespace, two collections `data_objects_layer` +
-   `semantic_layer`, HNSW index, cosine or euclidean score (Vectorize has no `halfvec`;
-   embeddings are float32).
+1. **Provision Hyperdrive** (task 5) against managed Postgres. Disable query
+   caching for frontend authentication and other read-after-write operations.
+   Supply the Hyperdrive ID through `CLOUDFLARE_HYPERDRIVE_ID` at frontend
+   build/deployment; keep origin credentials in Hyperdrive, not the repository.
+2. **Blocked on Phase 0 task 4:** provision two Vectorize indexes only after choosing a
+   compatible embedding strategy (maximum 1,536 dimensions). Match index dimensions and
+   metric to that strategy; re-embed both collections before cutover.
 3. **Provision R2** (blobs) and **D1/KV** (sessions, rate-limit counters, short-lived caches).
 4. **Inject Cloudflare Secrets** via `wrangler secret put` (agent secret, Aurora/DB keys, LLM/
    prediction keys) and forward them into the Container via `CONTAINER_ENV_SECRETS`; set
@@ -321,76 +336,30 @@ connectionString = "postgresql://user:pass@aurora-endpoint:5432/auto_ontology?ss
 
 ---
 
-## 5b. DO <-> Container agent gateway with SSE (prototype - done)
+## 5b. Worker and Container gateway (prototype)
 
-Files added in `workers/` (a new tree, no changes to the Python repo):
+`workers/src/agent-gateway.ts` authenticates frontend-server requests using
+`CLOUDFLARE_AGENT_SECRET` and routes by trusted user ID to `AgentDo`. The
+Durable Object starts the Python Container and streams the response without
+buffering. The gateway does not itself authenticate end users: the frontend
+must enforce authentication and route permissions.
 
-- `src/agent-gateway.ts` - Worker entry point. `/health` (public, no auth), else `resolveIdentity()`
-  then route to a per-session Durable Object via `AGENT_DO.idFromName(sessionId)`.
-- `src/agent-do.ts` - Session Durable Object. `ctx.container.start({ instance, instance_type })`
-  boots/resumes the agent Container; proxies the request to `127.0.0.1:AGENT_PORT`; returns the
-  container's response **verbatim** so the SSE `text/event-stream` body is relayed token-by-token.
-  `POST /chat/cancel` flips an in-DO run flag. One DO per session keeps a warm instance for the
-  whole conversation.
-- `src/agent-container.ts` - Container lifecycle class. `sleepAfter = 30m` (default 10m is too short
-  for a HITL pause) and `onActivityExpired` is a no-op so the instance stays warm; the DO stops it
-  explicitly when the session ends.
-- `src/auth.ts` - Identity contract mirroring the agent's `resolve_internal_user`. Two paths:
-  (1) internal shared-secret `Authorization: Bearer <CLOUDFLARE_AGENT_SECRET>` -> inject
-  `x-auto-ontology-user-id`; (2) SSO bearer token when `ANY_CONNECTION_USES_SSO_FEDERATION=true`.
-- `wrangler.toml` - `[[containers]]` with `scheduling_policy = "durable_object"`, `class_name =
-  "AgentContainer"`, `image = "./Dockerfile"` (the existing agent image, reused unchanged),
-  `instance_type = "standard-1"`; `[[durable_objects.bindings]] AGENT_DO -> AgentDo`; `[exports.AgentDo]`
-  `type = "durable-object" storage = "sqlite"`. `CONTAINER_ENV_SECRETS` (comma-separated) lists the
-  Cloudflare Secrets forwarded into the Container at start so the agent can run (DB + LLM keys).
-- `smoke-test.sh` / `deploy.sh` - deploy + Tier 1 (health/401) / Tier 2 (SSE e2e) smoke tests.
-- `types/cloudflare-containers.d.ts` - ambient types for the Container lifecycle API (`Container`,
-  `ContainerInstance`, `ContainerNamespace`). The published `@cloudflare/workers-types` lags the
-  Container runtime, so these are declared locally.
-- `types/globals.d.ts` - the global `Env` type (normally wrangler-generated).
-
-**Verified:** `tsc -p workers/tsconfig.json` exits 0 (strict). The agent image and Python code are
-**unchanged** for H2 — the gateway is a pure proxy.
-
-**Deploy:**
-
-```bash
-cd workers
-wrangler secret put CLOUDFLARE_AGENT_SECRET --value '<secret>'
-wrangler deploy
-# client:
-curl -X POST https://<worker>/chat/completions \
-  -H "Authorization: Bearer $CLOUDFLARE_AGENT_SECRET" \
-  -H "x-auto-ontology-user-id: <user>" \
-  -d '{"messages":[...]}'   # -> text/event-stream, ends with data: [DONE]
-```
-
-**Phase 3 task 13 — LLM/embedding wiring (kept via container egress, not Workers AI):**
-the Python agent runs inside the Container, so Workers AI (a Workers-only API) is not a
-fit; the agent reaches NVAPI + Kumo over the public internet instead.
-- `src/agent-do.ts` sets `enableInternet` on `ctx.container.start()`
-  (`CONTAINER_ENABLE_INTERNET`, default `true`) so the agent can make its LLM/embedding/
-  Kumo calls. Leave `false` to sandbox the container.
-- `wrangler.toml` `[vars]` `CONTAINER_ENV_SECRETS` now forwards the agent's LLM/prediction
-  secrets alongside the DB keys: `KUMO_RFM_API_URL` (required by the predictor; omit to
-  disable Kumo), `DEFAULT_MODELS_API_KEY` (shared fallback for every REASONING/NON_REASONING/
-  EMBED/RERANK triplet), and the per-triplet `*_API_KEY` overrides. Endpoints and models fall
-  back to built-in NVAPI defaults, or set `DEFAULT_MODELS_*`.
-- `types/globals.d.ts` declares `CONTAINER_ENABLE_INTERNET` on `Env`.
-
-> The `durable_object` Container scheduling policy is in **beta**; confirm the exact
-> `ctx.container.start` / `getByName` signatures against the live Container API at deploy time.
+`workers/wrangler.toml` declares the Worker and Container image. Configure
+secrets and environment variables as described in `workers/README.md`.
+The Durable Object scheduling policy is beta. Typechecking and local auth
+checks do not prove Container startup or end-to-end streaming on Cloudflare.
 
 ---
 
-## 5c. Frontend agent-streaming proxy (prototype - done)
+## 5c. Frontend agent-streaming proxy (prototype)
 
 The three chat Route Handlers previously hard-coded a hop to the FastAPI backend
 (`PYTHON_API_URL`, default `127.0.0.1:3001`). For the Container gateway they now forward through a
 single shared helper:
 
 - `frontend/lib/containerProxy.ts` - `forwardToContainer({ path, method, body, headers })` resolves
-  `AGENT_GATEWAY_URL` (default `127.0.0.1:3001`) and forwards verbatim; `SSE_RESPONSE_HEADERS`
+  `AGENT_GATEWAY_URL` (required on Workers; local development defaults to `127.0.0.1:3001`);
+  `SSE_RESPONSE_HEADERS`
   carries the `text/event-stream` headers (`Content-Type`, `no-cache`, `keep-alive`,
   `X-Accel-Buffering: no`) once, centrally.
 
@@ -407,39 +376,34 @@ unchanged — it already uses relative URLs, so the only move is server-side.
 **Verified:** `tsc --noEmit` in `frontend/` exits 0 (strict) after `npm install`.
 
 ---
-## 5d. Frontend Cloudflare migration via vinext (prototype - done)
+## 5d. Frontend Cloudflare migration via vinext (prototype - incomplete)
 
-The frontend (Next.js App Router) was migrated to Cloudflare with **vinext**, which builds the
-existing App Router directly to Cloudflare Pages + Workers — no Pages-Router conversion and no
-`next-on-workers`. The client (`api/chat.ts` → `lib/useChat.ts`) is unchanged; only the server
-side moved.
+The vinext configuration builds the existing Next.js App Router for a Cloudflare
+Worker. A successful build does not prove that authentication, data routes, or
+streaming work in the Workers runtime.
 
 Files added:
 
-- `vite.config.ts` — vinext RSC+SSR build with the Cloudflare `cloudflare()` plugin (RSC
-  environment + SSR child environments, KV cache adapter, images optimizer).
+- `vite.config.ts` — vinext RSC+SSR build with the Cloudflare plugin, KV cache
+  adapter, images optimizer, and SVGR for the existing icon components.
 - `cloudflare.config.ts` — the Cloudflare worker: `entrypoint: "vinext/server/fetch-handler"`,
   `compatibilityDate: 2026-11-11`, assets plus `VINEXT_KV_CACHE` / `IMAGES` bindings.
-- `auth/proxy-backend.ts` — `proxyToBackend(req, { userId })` forwards method/path/query/body
-  verbatim to the backend (`PYTHON_API_URL`, default `127.0.0.1:3001`), binary-safe, with
-  `withPermission` still gating each route. Zone scoping is intentionally not applied (the
-  backend's unscoped `zone_ids` default is what every proxied call gets).
+- `auth/proxy-backend.ts` — permission-gated backend requests use the gateway
+  when configured; local development can still reach `PYTHON_API_URL` directly.
 
 Files changed:
 
 - `app/api/acronyms`, `app/api/analytics`, `app/api/conversations`, `app/api/custom-prompts`,
-  `app/api/configurations/*` — replace in-process Prisma reads/writes with `proxyToBackend`; the
-  Container owns the `frontend` schema tables, so the request (query string included) forwards
-  verbatim and the answer comes back unchanged.
+  `app/api/configurations/*` — restored frontend Prisma operations against the
+  shared Postgres schema; D1 migration and Workers runtime checks remain open.
 - `package.json` — add `vinext`, `vite`, `@cloudflare/vite-plugin`, `@vinext/cloudflare` and the
   `dev/build/start/deploy:vinext` scripts; `pnpm-lock.yaml` regenerated.
 - `tsconfig.json` — exclude `.cloudflare/**`; `.gitignore` ignores `/dist`, `.vinext`,
   `.cloudflare`.
 
-**Open — higher-risk item:** `better-auth` (`frontend/auth/auth.ts`, `prismaAdapter` +
-`getPrisma()`) and its `/api/auth/[...all]` route still run in the frontend build. The Prisma
-Postgres adapter cannot connect on the Workers edge runtime, so this route must be proxied to the
-Container (consistent with the data routes above) before go-live.
+**Open:** Better Auth and frontend-owned state still depend on the Postgres
+`frontend` schema, which Python also reads and writes directly. Migrating that
+state to D1 requires coordinated changes on both sides; see Phase 4.
 
 **Verified:** `tsc --noEmit` and `vite build` (`build:vinext`) both exit 0 in `frontend/`.
 

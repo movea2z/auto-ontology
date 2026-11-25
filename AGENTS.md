@@ -4,16 +4,110 @@ All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# AGENTS.md — Auto-Ontology agent entry point
+# Repository Guidelines
 
-Skills that teach an agent how to **set up** the current Auto-Ontology implementation and
-**use** its ontology layer. They live in **`skills/`** (repo root), one directory
-per skill, under the durable `nvidia-ontology*` namespace.
+## Project Overview
 
-This file is for developers bringing Auto-Ontology up and partners embedding it in an
-agent harness. Auto-Ontology **maintainers** (build, test, schema, frontend conventions)
-stay on [`CLAUDE.md`](./CLAUDE.md). Do not fold those conventions into these
-skills.
+Auto-Ontology builds a semantic layer over enterprise data for agent-assisted
+discovery and text-to-SQL. The Python backend, Next.js frontend, and read-only
+MCP server are separate components; see `README.md` for product and setup details.
+
+Repository skills in `skills/` guide installation and use of the ontology layer.
+Keep workflow guidance in those skills, not duplicate API catalogs or installers.
+
+## Architecture & Data Flow
+
+Connectors extract source metadata; catalog ingestion stores it in PostgreSQL.
+Semantic compilation builds the ontology and search embeddings; retrieval and
+the LangGraph text-to-SQL workflow use those layers to answer questions.
+The Next.js frontend provides the UI, authentication, and `/api/...` surface;
+FastAPI serves backend operations, while the separate MCP server calls the
+application over HTTP.
+
+Keep FastAPI and ingestion endpoints private: frontend authentication establishes
+identity before forwarding trusted user headers. MCP targets the frontend API,
+not the unauthenticated backend port. Use the same embedding model and endpoint
+for ingestion and retrieval; changing embedding space requires re-indexing.
+
+## Code Conventions & Common Patterns
+
+- Keep FastAPI routers thin; follow adjacent `router.py` / `service.py` / DAL
+  boundaries. Define persistent backend tables in SQLAlchemy Core and migrate
+  with Alembic; do not bypass existing transaction and session helpers.
+- Frontend route handlers use `withPublic` or `withPermission` from
+  `frontend/auth/with-auth.ts`; preserve authorization when changing routes.
+- Use typed models and existing async/streaming interfaces where applicable;
+  avoid buffering streaming chat responses. Follow nearby error handling and
+  return explicit failures instead of inventing successful fallbacks.
+- Chat uses a worker subprocess and LangGraph text-to-SQL state; preserve
+  existing cancellation and streaming lifecycles. Pass dependencies explicitly,
+  following neighboring code.
+- Add SPDX headers to new source files, matching adjacent files.
+
+## Key Directories
+
+- `auto_ontology/server/`: FastAPI routes, services, chat, and identity.
+- `auto_ontology/connectors/`, `catalog/`, `ingestion_service/`: source
+  connectors, catalog extraction, and scheduled ingestion.
+- `auto_ontology/dal/`, `semantic/`, `vdb/`, `retrieval/`: persistence,
+  semantic compilation, vector search, and text-to-SQL workflows.
+- `frontend/`: Next.js App Router, UI, API handlers, authentication, and Prisma.
+- `mcp/`: independently packaged HTTP client and MCP server.
+- `alembic/`, `dev_tools/`, `helm/`, `docs/`: migrations, development/fixtures,
+  Kubernetes deployment, and API documentation.
+- `workers/`: Cloudflare gateway prototype; see `CLOUDFLARE-REWRITE-PLAN.md`
+  for open migration blockers, rather than assuming production readiness.
+
+## Important Files
+
+- `auto_ontology/server/__main__.py`: FastAPI application factory.
+- `auto_ontology/dal/schema.py`, `alembic/versions/`: backend schema and migrations.
+- `frontend/prisma/schema.prisma`: frontend schema.
+- `frontend/auth/with-auth.ts`: API route authorization wrappers.
+- `mcp/auto_ontology_mcp/tools.py`: read-only MCP tool registration.
+- `.env.example`, `docker-compose.yml`, `DEPLOYMENT.md`: configuration and setup.
+
+## Development Commands
+
+```bash
+uv sync
+(cd frontend && pnpm install)
+./dev_tools/setup_env.sh --dev               # infrastructure only
+# Run each server in a separate terminal:
+uv run python -m auto_ontology.server         # backend, port 3001
+(cd frontend && pnpm dev)                    # frontend, port 3000; pushes Prisma schema
+# Run checks from the repository root:
+uv run pytest auto_ontology dev_tools -q
+uv run ruff check .
+(cd frontend && pnpm lint && pnpm format:check)
+(cd mcp && uv run pytest)
+```
+
+For reload, use `uv run uvicorn auto_ontology.server.__main__:create_app --factory
+--reload --host 127.0.0.1 --port 3001`. See `dev_tools/README.md` for fixture
+seeding and Compose modes. `make migrate`, `make migrate-check`, and `make
+migrate-revision m="description"` operate on backend Alembic migrations.
+
+## Runtime/Tooling Preferences
+
+- Backend requires Python 3.12–3.13; use `uv` and the root `uv.lock`. MCP is a
+  separate project requiring Python 3.11+ and has its own lockfile.
+- Frontend uses Node.js and `pnpm@10.34.3`; use `frontend/pnpm-lock.yaml`.
+  `pnpm dev` runs `prisma db push`, so point it only at a suitable database.
+- Python Ruff uses 88 columns and selected rules in `pyproject.toml`. Frontend
+  Prettier uses tabs, single quotes, semicolons, trailing commas, and 100 columns.
+  Run `cd frontend && npx prettier --write <changed-files>` after frontend edits.
+
+## Testing & QA
+
+- Root pytest excludes `mcp/`; run MCP tests independently from `mcp/`.
+  CI uses pgvector-enabled PostgreSQL, Alembic migrations, and fixture databases;
+  follow `dev_tools/README.md` for seeding. MCP tests use mocked HTTP.
+- No coverage threshold is configured. Backend CI checks skipped tests; frontend
+  CI runs format, lint, and build. Run focused tests for changed behavior.
+- Backend and frontend schemas have separate migration paths: Alembic owns
+  backend tables in `public`, while Prisma owns tables in `frontend`. Keep schema
+  changes and migrations aligned.
 
 ## Which skill to read
 

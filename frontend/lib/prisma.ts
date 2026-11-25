@@ -27,7 +27,7 @@ function buildConnectionString(): string {
 		);
 	}
 
-	return `postgresql://${user}:${password}@${host}:${port}/${database}`;
+	return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}`;
 }
 
 function createPrismaClient(): PrismaClient {

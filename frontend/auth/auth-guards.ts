@@ -4,11 +4,11 @@
 
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { auth } from '@/auth/auth';
+import { getAuth } from '@/auth/auth';
 import { Role } from '@/enums/auth';
 
 /** Authoritative session lookup for server components and route handlers. */
-export const getCurrentSession = async () => auth.api.getSession({ headers: await headers() });
+export const getCurrentSession = async () => getAuth().api.getSession({ headers: await headers() });
 
 /** Require any authenticated user; redirect to /login otherwise. */
 export const requireUser = async () => {
