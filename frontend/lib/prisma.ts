@@ -8,6 +8,15 @@ import { PrismaPg } from '@prisma/adapter-pg';
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
 
 function buildConnectionString(): string {
+	// Neon pulls a pooled connection string into DATABASE_URL. Prefer it when set,
+	// it already carries sslmode=require and the Neon host/port/creds, and pooling,
+	// is the right choice for a web server. Fall back to the per-field POSTGRES_*,
+	// vars for local dev (localhost), which is how dev_tools seeds the stack.
+	const neonUrl = process.env.DATABASE_URL;
+	if (neonUrl) {
+		return neonUrl;
+	}
+
 	const host = process.env.POSTGRES_HOST ?? 'localhost';
 	const port = process.env.POSTGRES_PORT ?? '5432';
 	const user = process.env.POSTGRES_USER;
